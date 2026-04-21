@@ -1,0 +1,16 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: banking-ingress
+  namespace: banking-prod
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /api/accounts
+            pathType: Prefix
+            backend:
+              service:
+                name: account-service
+                port:
+                  number: 80
