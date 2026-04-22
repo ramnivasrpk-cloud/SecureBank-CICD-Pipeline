@@ -1,6 +1,10 @@
 apiVersion: v2
 name: securebank
-description: SecureBank Helm Chart
+description: SecureBank Banking Application Helm Chart
 type: application
 version: 1.0.0
-appVersion: "1.0"
+appVersion: '2025.1'
+maintainers:
+  - name: DevOps Team
+    email: devops@securebank.com
+
