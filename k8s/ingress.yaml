@@ -3,14 +3,36 @@ kind: Ingress
 metadata:
   name: banking-ingress
   namespace: banking-prod
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: '443'
+    alb.ingress.kubernetes.io/certificate-arn: 'arn:aws:acm:us-east-1:123456789:certificate/...'
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/group.name: securebank-group
 spec:
   rules:
-    - http:
-        paths:
-          - path: /api/accounts
-            pathType: Prefix
-            backend:
-              service:
-                name: account-service
-                port:
-                  number: 80
+  - host: api.securebank.com
+    http:
+      paths:
+      - path: /api/accounts
+        pathType: Prefix
+        backend:
+          service:
+            name: account-service
+            port: { number: 80 }
+      - path: /api/transactions
+        pathType: Prefix
+        backend:
+          service:
+            name: transaction-service
+            port: { number: 80 }
+      - path: /api/auth
+        pathType: Prefix
+        backend:
+          service:
+            name: auth-service
+            port: { number: 80 }
+
