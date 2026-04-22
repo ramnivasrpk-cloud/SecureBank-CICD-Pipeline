@@ -3,18 +3,84 @@ kind: Deployment
 metadata:
   name: account-service
   namespace: banking-prod
+  labels:
+    app: account-service
+    version: v1
+    tier: backend
 spec:
-  replicas: 2
+  replicas: 3
   selector:
     matchLabels:
       app: account-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1        # Allow 1 extra pod during update
+      maxUnavailable: 0  # Never reduce below desired count (zero downtime)
   template:
     metadata:
       labels:
         app: account-service
+        version: v1
     spec:
+      serviceAccountName: banking-service-account
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
       containers:
-        - name: account-service
-          image: ACCOUNT_ECR_IMAGE
-          ports:
-            - containerPort: 8080
+      - name: account-service
+        image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/securebank/account-service:prod-42
+        ports:
+        - containerPort: 8080
+          name: http
+        # Environment: non-secret values
+        env:
+        - name: SPRING_PROFILES_ACTIVE
+          value: 'prod'
+        - name: AWS_REGION
+          value: 'us-east-1'
+        # Environment: from K8s secret
+        - name: DB_HOST
+          valueFrom:
+            secretKeyRef:
+              name: banking-secrets
+              key: DB_HOST
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: banking-secrets
+              key: DB_PASSWORD
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: banking-secrets
+              key: JWT_SECRET
+        # Resource limits (important for banking stability)
+        resources:
+          requests:
+            memory: '256Mi'
+            cpu: '200m'
+          limits:
+            memory: '512Mi'
+            cpu: '500m'
+        # Readiness probe: only send traffic when app is ready
+        readinessProbe:
+          httpGet:
+            path: /api/accounts/health
+            port: 8080
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          failureThreshold: 3
+        # Liveness probe: restart if app hangs
+        livenessProbe:
+          httpGet:
+            path: /api/accounts/health
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 15
+          failureThreshold: 3
+      # Image pull secret for ECR
+      imagePullSecrets:
+      - name: ecr-registry-key
+
