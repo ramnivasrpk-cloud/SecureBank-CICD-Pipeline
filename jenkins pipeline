@@ -1,0 +1,291 @@
+// jenkins/Jenkinsfile
+// SecureBank Banking Application — Full CI/CD Pipeline
+ 
+pipeline {
+    agent any
+ 
+    // ── Parameters (manual trigger options) ──────────────────
+    parameters {
+        choice(name: 'SERVICE',
+               choices: ['account-service','transaction-service','auth-service','all'],
+               description: 'Which service to build and deploy?')
+        choice(name: 'DEPLOY_ENV',
+               choices: ['dev', 'staging', 'prod'],
+               description: 'Target environment')
+        booleanParam(name: 'SKIP_TESTS', defaultValue: false,
+                     description: 'Skip unit tests? (not recommended)')
+        booleanParam(name: 'SKIP_SONAR', defaultValue: false,
+                     description: 'Skip SonarQube scan?')
+    }
+ 
+    // ── Environment Variables ─────────────────────────────────
+    environment {
+        // AWS & ECR
+        AWS_REGION     = 'us-east-1'
+        AWS_ACCOUNT_ID = '123456789012'
+        ECR_REGISTRY   = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        ECR_REPO       = "securebank/${params.SERVICE}"
+        IMAGE_TAG      = "${params.DEPLOY_ENV}-${BUILD_NUMBER}"
+ 
+        // EKS
+        EKS_CLUSTER    = 'securebank-eks-cluster'
+        K8S_NAMESPACE  = "banking-${params.DEPLOY_ENV}"
+ 
+        // SonarQube
+        SONAR_HOST     = 'http://localhost:9000'
+ 
+        // Credentials (stored in Jenkins Credentials Manager)
+        AWS_CREDS      = 'aws-securebank-credentials'
+        SONAR_TOKEN    = credentials('sonarqube-token')
+        SLACK_CHANNEL  = '#banking-deployments'
+    }
+ 
+    // ── Pipeline Options ──────────────────────────────────────
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 45, unit: 'MINUTES')
+        disableConcurrentBuilds()  // No parallel deployments
+        timestamps()
+    }
+ 
+    stages {
+ 
+        // ── STAGE 1: Checkout ────────────────────────────────
+        stage('Checkout Code') {
+            steps {
+                git branch: 'main',
+                    credentialsId: 'github-securebank',
+                    url: 'https://github.com/securebank/banking-app.git'
+                script {
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: 'git rev-parse --short HEAD',
+                        returnStdout: true).trim()
+                }
+                echo "Building commit: ${GIT_COMMIT_SHORT} | Service: ${params.SERVICE}"
+            }
+        }
+ 
+        // ── STAGE 2: Maven Build & Unit Tests ────────────────
+        stage('Build & Unit Tests') {
+            when { not { expression { params.SKIP_TESTS } } }
+            steps {
+                dir("services/${params.SERVICE}") {
+                    sh '''
+                        mvn clean verify \
+                          -Dspring.profiles.active=test \
+                          -B \
+                          --no-transfer-progress
+                    '''
+                }
+            }
+            post {
+                always {
+                    // Publish JUnit test results
+                    junit "services/${params.SERVICE}/target/surefire-reports/**/*.xml"
+                    // Publish code coverage
+                    jacoco(
+                        execPattern: "services/${params.SERVICE}/target/jacoco.exec",
+                        classPattern:  "services/${params.SERVICE}/target/classes",
+                        sourcePattern: "services/${params.SERVICE}/src/main/java",
+                        minimumLineCoverage: '70'
+                    )
+                }
+            }
+        }
+ 
+        // ── STAGE 3: SonarQube Code Quality Scan ─────────────
+        stage('SonarQube Analysis') {
+            when { not { expression { params.SKIP_SONAR } } }
+            steps {
+                withSonarQubeEnv('sonarqube-server') {
+                    dir("services/${params.SERVICE}") {
+                        sh '''
+                            mvn sonar:sonar \
+                              -Dsonar.projectKey=securebank-${SERVICE} \
+                              -Dsonar.host.url=${SONAR_HOST} \
+                              -Dsonar.login=${SONAR_TOKEN} \
+                              -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+                        '''
+                    }
+                }
+                // Wait for SonarQube quality gate result
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+ 
+        // ── STAGE 4: Docker Build ─────────────────────────────
+        stage('Build Docker Image') {
+            steps {
+                dir("services/${params.SERVICE}") {
+                    sh '''
+                        docker build \
+                          -t ${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG} \
+                          -t ${ECR_REGISTRY}/${ECR_REPO}:latest \
+                          --label git-commit=${GIT_COMMIT_SHORT} \
+                          --label build-number=${BUILD_NUMBER} \
+                          --label service=${SERVICE} \
+                          --no-cache .
+                    '''
+                }
+            }
+        }
+ 
+        // ── STAGE 5: Trivy Security Scan ──────────────────────
+        stage('Trivy Image Scan') {
+            steps {
+                sh '''
+                    trivy image \
+                      --exit-code 1 \
+                      --severity HIGH,CRITICAL \
+                      --no-progress \
+                      --format table \
+                      ${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG} 2>&1 | tee trivy-report.txt
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-report.txt', fingerprint: true
+                }
+            }
+        }
+ 
+        // ── STAGE 6: Push Image to ECR ────────────────────────
+        stage('Push to ECR') {
+            steps {
+                withAWS(credentials: AWS_CREDS, region: AWS_REGION) {
+                    sh '''
+                        # Login to ECR
+                        aws ecr get-login-password --region ${AWS_REGION} | \
+                          docker login --username AWS --password-stdin ${ECR_REGISTRY}
+ 
+                        # Push both tags
+                        docker push ${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG}
+                        docker push ${ECR_REGISTRY}/${ECR_REPO}:latest
+ 
+                        echo "Pushed: ${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG}"
+                    '''
+                }
+            }
+        }
+ 
+        // ── STAGE 7: Deploy to EKS (Helm) ────────────────────
+        stage('Deploy to EKS') {
+            steps {
+                withAWS(credentials: AWS_CREDS, region: AWS_REGION) {
+                    sh '''
+                        # Connect to EKS cluster
+                        aws eks update-kubeconfig \
+                            --region ${AWS_REGION} \
+                            --name ${EKS_CLUSTER}
+ 
+                        # Create namespace if it doesn't exist
+                        kubectl get namespace ${K8S_NAMESPACE} || \
+                            kubectl create namespace ${K8S_NAMESPACE}
+ 
+                        # Deploy using Helm
+                        helm upgrade --install ${SERVICE} ./helm \
+                            --namespace ${K8S_NAMESPACE} \
+                            --values helm/values-${DEPLOY_ENV}.yaml \
+                            --set image.repository=${ECR_REGISTRY}/${ECR_REPO} \
+                            --set image.tag=${IMAGE_TAG} \
+                            --set environment=${DEPLOY_ENV} \
+                            --wait \
+                            --timeout 5m \
+                            --atomic  # Auto rollback on failure
+ 
+                        # Verify deployment
+                        kubectl rollout status \
+                            deployment/${SERVICE} \
+                            -n ${K8S_NAMESPACE} \
+                            --timeout=5m
+ 
+                        # Show running pods
+                        kubectl get pods -n ${K8S_NAMESPACE} -l app=${SERVICE}
+                    '''
+                }
+            }
+        }
+ 
+        // ── STAGE 8: OWASP ZAP (only staging) ────────────────
+        stage('OWASP ZAP Security Test') {
+            when {
+                expression { params.DEPLOY_ENV == 'staging' }
+            }
+            steps {
+                sh '''
+                    # Get service URL
+                    SVC_URL=$(kubectl get ingress banking-ingress \
+                        -n ${K8S_NAMESPACE} \
+                        -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+ 
+                    # Run OWASP ZAP baseline scan
+                    docker run --rm owasp/zap2docker-stable \
+                        zap-baseline.py \
+                        -t http://$SVC_URL/api \
+                        -r zap-report.html \
+                        -I  # Don't fail on warnings
+                '''
+            }
+            post {
+                always {
+                    publishHTML(target: [
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: '.',
+                        reportFiles: 'zap-report.html',
+                        reportName: 'OWASP ZAP Report'
+                    ])
+                }
+            }
+        }
+ 
+        // ── STAGE 9: Production Gate (approval) ───────────────
+        stage('Production Approval') {
+            when {
+                expression { params.DEPLOY_ENV == 'prod' }
+            }
+            steps {
+                input message: '''
+                    PRODUCTION DEPLOYMENT APPROVAL REQUIRED
+                    Service:     ${SERVICE}
+                    Image Tag:   ${IMAGE_TAG}
+                    Approver:    Release Manager must approve below
+                ''', ok: 'Approve Production Deploy'
+            }
+        }
+ 
+    } // end stages
+ 
+    // ── Post Pipeline ─────────────────────────────────────────
+    post {
+        success {
+            slackSend(
+                channel: SLACK_CHANNEL,
+                color: 'good',
+                message: ":white_check_mark: *DEPLOYED* | ${SERVICE} | ${IMAGE_TAG} | ${DEPLOY_ENV} | <${BUILD_URL}|Build #${BUILD_NUMBER}>"
+            )
+        }
+        failure {
+            slackSend(
+                channel: SLACK_CHANNEL,
+                color: 'danger',
+                message: ":x: *FAILED* | ${SERVICE} | Build #${BUILD_NUMBER} | <${BUILD_URL}|View Logs>"
+            )
+            emailext(
+                subject: "BANKING PIPELINE FAILED: ${SERVICE} #${BUILD_NUMBER}",
+                body: 'See: ${BUILD_URL}',
+                to: 'devops-team@securebank.com'
+            )
+        }
+        always {
+            // Clean up Docker images to save disk space
+            sh 'docker rmi ${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG} || true'
+            sh 'docker rmi ${ECR_REGISTRY}/${ECR_REPO}:latest || true'
+            sh 'docker system prune -f || true'
+            cleanWs()
+        }
+    }
+}
